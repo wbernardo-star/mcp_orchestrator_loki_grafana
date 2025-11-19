@@ -1,4 +1,4 @@
-#Loki Py MS
+#loki sync i/o
 
 import os
 import time
@@ -16,26 +16,17 @@ class LokiLogger:
       - GRAFANA_LOKI_API_TOKEN token with logs:write
       - MCP_APP_LABEL          (optional) app label, default "mcp_orchestrator_sync"
 
-    Usage from main.py:
-
-        from .logging_loki import loki
-
-        loki.log("info", {"event_type": "health"}, service_type="orchestrator")
-
-        loki.log(
-            "info",
-            {
-                "event_type": "input",
-                "user": req.user_id,
-                "channel": req.channel,
-                "session_id": session_id,
-                "turn": state.turn_count,
-                "text": req.text,
-            },
-            flow=state.flow or "none",
-            step=state.step or "none",
-            service_type="orchestrator",
-        )
+    Labels used in Loki:
+      - app          (fixed per service)
+      - level        (info / error / warning)
+      - event        (input / output / error / health / session_reset / ...)
+      - service      (orchestrator / llm / tts / webhook / ...)
+      - flow         (food_order / none / ...)
+      - step         (ask_category / collect_items / ...)
+      - intent       (optional future)
+      - outcome      (optional future)
+      - mode         (sync / async)
+      - io           (in / out)
     """
 
     def __init__(self) -> None:
@@ -54,19 +45,7 @@ class LokiLogger:
 
     def _build_stream_labels(self, level: str, fields: dict) -> dict:
         """
-        Build Loki 'stream' labels.
-
-        LOW-cardinality labels only:
-          - app
-          - level
-          - event
-          - service
-          - flow
-          - step
-          - intent
-          - outcome
-
-        High-card items like session_id remain in JSON body.
+        Build Loki 'stream' labels (low-cardinality only).
         """
         labels = {
             "app": self.app_label,
@@ -78,7 +57,7 @@ class LokiLogger:
         if event:
             labels["event"] = str(event)
 
-        # Promote a few keys as Loki labels if present
+        # Promote keys to Loki labels
         mapping = {
             "service_type": "service",
             "service": "service",
@@ -86,7 +65,10 @@ class LokiLogger:
             "step": "step",
             "intent": "intent",
             "outcome": "outcome",
+            "sync_mode": "mode",   # <-- sync vs async
+            "io": "io",            # <-- input vs output
         }
+
         for src, dst in mapping.items():
             val = fields.get(src)
             if val not in (None, "", []):
@@ -102,12 +84,12 @@ class LokiLogger:
 
         level   : "info", "warning", "error", etc.
         message : str OR dict
-        fields  : extra context: event, flow, step, service_type, session_id, etc.
+        fields  : extra context: event, flow, step, service_type,
+                  session_id, sync_mode, io, etc.
         """
         if not self.enabled:
             return
 
-        # Build structured JSON body
         if isinstance(message, dict):
             payload_fields = {**fields, **message}
         else:

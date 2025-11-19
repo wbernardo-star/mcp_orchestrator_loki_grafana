@@ -1,209 +1,119 @@
-
 from __future__ import annotations
 
-import logging
 import time
-from typing import Dict, Any
+from datetime import datetime, timezone
+from typing import Dict, Optional
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse, Response
-from prometheus_client import Counter, Histogram, generate_latest
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 
 from .logging_loki import loki
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger("mcp.main")
 
-app = FastAPI(title="MCP Orchestrator – Sync + Full Food Flow + Observability", version="1.0.0")
-
-# Metrics
-REQ = Counter("mcp_requests_total", "Total MCP orchestrator requests")
-LAT = Histogram("mcp_request_latency_seconds", "MCP orchestrator latency in seconds")
-
-# Service catalog (metadata only)
-SERVICE_CATALOG: Dict[str, Dict[str, Any]] = {
-    "whisper_stt": {
-        "mode": "async",
-        "protocol": "http",
-        "critical": True,
-        "description": "Speech-to-Text (listening client / Whisper).",
-    },
-    "elevenlabs_tts": {
-        "mode": "sync",
-        "protocol": "http",
-        "critical": False,
-        "description": "Text-to-Speech output (ElevenLabs).",
-    },
-    "n8n_intent_validator": {
-        "mode": "sync",
-        "protocol": "http",
-        "critical": True,
-        "description": "External intent / menu validation via n8n webhook.",
-    },
-}
-
-# In-memory session store:
-#   { session_id: { flow, step, scratchpad, flags, turn_count } }
-SESSION_STORE: Dict[str, Dict[str, Any]] = {}
+# ----------------- Models -----------------
 
 
-def get_or_create_session_state(session_id: str) -> Dict[str, Any]:
+class OrchestrateRequest(BaseModel):
+    text: str
+    user_id: str
+    channel: str = "web"
+    session_id: Optional[str] = None
+
+
+class OrchestrateResponse(BaseModel):
+    decision: str
+    reply_text: str
+    flow: Optional[str] = None
+    step: Optional[str] = None
+    session_id: str
+
+
+# ----------------- Simple in-memory Session Context -----------------
+
+
+class SessionState(BaseModel):
+    flow: Optional[str] = None
+    step: Optional[str] = None
+    scratchpad: Dict[str, str] = {}
+    turn_count: int = 0
+    last_active_at: Optional[datetime] = None
+
+
+# Very simple in-memory store: {session_id: SessionState}
+SESSION_STORE: Dict[str, SessionState] = {}
+
+
+def get_session(session_id: str) -> SessionState:
     if session_id not in SESSION_STORE:
-        SESSION_STORE[session_id] = {
-            "flow": None,
-            "step": None,
-            "scratchpad": {},
-            "flags": {},
-            "turn_count": 0,
-        }
+        SESSION_STORE[session_id] = SessionState()
     return SESSION_STORE[session_id]
 
 
-def reset_session_state(session_id: str) -> None:
-    SESSION_STORE[session_id] = {
-        "flow": None,
-        "step": None,
-        "scratchpad": {},
-        "flags": {},
-        "turn_count": 0,
-    }
+def reset_session(session_id: str) -> None:
+    SESSION_STORE[session_id] = SessionState()
 
 
-@app.get("/health")
-def health():
-    logger.info("health_check")
-    loki.log("info", "health_check", event="health")
-    return {"status": "ok", "block": "mcp_orchestrator_sync_full_flow"}
+# ----------------- Food-ordering core -----------------
 
 
-@app.get("/services")
-def services():
-    logger.info("services_listed size=%s", len(SERVICE_CATALOG))
-    return JSONResponse(content=SERVICE_CATALOG)
-
-
-@app.get("/metrics")
-def metrics():
-    return Response(
-        generate_latest(),
-        media_type="text/plain; version=0.0.4; charset=utf-8",
-    )
-
-
-@app.post("/orchestrate")
-def orchestrate(body: Dict[str, Any]):
+def handle_food_flow(text: str, state: SessionState) -> (str, bool):
     """
-    Synchronous orchestration endpoint with:
-      - multi-session state
-      - full food-order flow
-      - Loki logging
-      - Prometheus metrics
-
-    Expected JSON:
-    {
-      "text": "I want to order food",
-      "user_id": "user-123",
-      "channel": "web",
-      "session_id": "optional-session-id"
-    }
+    Returns (reply_text, reset_after_reply_flag).
+    Implements your original hard-coded food ordering flow.
     """
-    start = time.time()
-    REQ.inc()
-
-    text = (body.get("text") or "").strip()
-    user_id = body.get("user_id") or "anonymous"
-    channel = body.get("channel") or "unknown"
-    session_id = body.get("session_id") or f"{user_id}:{channel}"
-
-    state = get_or_create_session_state(session_id)
-    state["turn_count"] += 1
-
-    logger.info(
-        "request_start session_id=%s user_id=%s channel=%s text=%s flow=%s step=%s turn=%s",
-        session_id,
-        user_id,
-        channel,
-        text,
-        state["flow"],
-        state["step"],
-        state["turn_count"],
-    )
-    loki.log(
-        "info",
-        "request_start",
-        event="input",
-        user=user_id,
-        channel=channel,
-        session_id=session_id,
-        flow=state["flow"],
-        step=state["step"],
-        turn=state["turn_count"],
-    )
-
-    # --------------------------------------------------
-    #  FULL STATEFUL FOOD ORDERING FLOW
-    # --------------------------------------------------
-    text_lower = text.lower()
+    text_lower = text.lower().strip()
     reset_after_reply = False
 
-    # 1) Start flow
-    if state["flow"] is None and any(
+    # 1) Start the food ordering flow
+    if state.flow is None and any(
         kw in text_lower for kw in ["order", "food", "pizza", "burger", "menu", "cravings"]
     ):
-        state["flow"] = "food_order"
-        state["step"] = "ask_category"
-        state["flags"]["awaiting_category"] = True
-
+        state.flow = "food_order"
+        state.step = "ask_category"
+        state.scratchpad["awaiting_category"] = "1"
         reply_text = (
             "Nice, let's order some food!\n"
-            "What type of food would you like? (e.g., pizza, burger, salad, chicken, ramen)"
+            "What type of food would you like? (example. pizza, burger, salad, chicken, ramen)"
         )
 
-    # 2) Ask category
-    elif state["flow"] == "food_order" and state["step"] == "ask_category":
-        state["scratchpad"]["category"] = text
-        state["step"] = "collect_items"
-        state["flags"]["awaiting_category"] = False
-        state["flags"]["awaiting_items"] = True
-
+    # 2) Ask category (pizza, burger, etc.)
+    elif state.flow == "food_order" and state.step == "ask_category":
+        state.scratchpad["category"] = text
+        state.step = "collect_items"
+        state.scratchpad.pop("awaiting_category", None)
+        state.scratchpad["awaiting_items"] = "1"
         reply_text = (
             f"Great, {text}!\n"
-            "What food items would you like to order? "
-            "Example: '1 large pepperoni, 1 garlic bread'."
+            "What food items would you like to order? Example: '1 large pepperoni, 1 garlic bread'."
         )
 
-    # 3) Collect items
-    elif state["flow"] == "food_order" and state["step"] == "collect_items":
-        state["scratchpad"]["items"] = text
-        state["step"] = "ask_address"
-        state["flags"]["awaiting_items"] = False
-        state["flags"]["awaiting_address"] = True
-
+    # 3) Collect food items
+    elif state.flow == "food_order" and state.step == "collect_items":
+        state.scratchpad["items"] = text
+        state.step = "ask_address"
+        state.scratchpad.pop("awaiting_items", None)
+        state.scratchpad["awaiting_address"] = "1"
         reply_text = "Got it!\nNext, what's the delivery address?"
 
-    # 4) Ask address
-    elif state["flow"] == "food_order" and state["step"] == "ask_address":
-        state["scratchpad"]["address"] = text
-        state["step"] = "ask_phone"
-        state["flags"]["awaiting_address"] = False
-        state["flags"]["awaiting_phone"] = True
-
+    # 4) Ask for address
+    elif state.flow == "food_order" and state.step == "ask_address":
+        state.scratchpad["address"] = text
+        state.step = "ask_phone"
+        state.scratchpad.pop("awaiting_address", None)
+        state.scratchpad["awaiting_phone"] = "1"
         reply_text = "Great — and what phone number should the driver call?"
 
-    # 5) Ask phone
-    elif state["flow"] == "food_order" and state["step"] == "ask_phone":
-        state["scratchpad"]["phone"] = text
-        state["step"] = "confirm_order"
-        state["flags"]["awaiting_phone"] = False
-        state["flags"]["awaiting_confirmation"] = True
+    # 5) Ask for phone number
+    elif state.flow == "food_order" and state.step == "ask_phone":
+        state.scratchpad["phone"] = text
+        state.step = "confirm_order"
+        state.scratchpad.pop("awaiting_phone", None)
+        state.scratchpad["awaiting_confirmation"] = "1"
 
-        category = state["scratchpad"].get("category", "food")
-        items = state["scratchpad"].get("items", "")
-        address = state["scratchpad"].get("address", "")
-        phone = state["scratchpad"].get("phone", "")
+        category = state.scratchpad.get("category", "food")
+        items = state.scratchpad.get("items", "")
+        address = state.scratchpad.get("address", "")
+        phone = state.scratchpad.get("phone", "")
 
         reply_text = (
             "Here’s your full order summary:\n"
@@ -214,16 +124,13 @@ def orchestrate(body: Dict[str, Any]):
             "Would you like to place this order? Please say Yes to confirm or No to cancel."
         )
 
-    # 6) Confirm
-    elif state["flow"] == "food_order" and state["step"] == "confirm_order":
+    # 6) Final confirmation
+    elif state.flow == "food_order" and state.step == "confirm_order":
         if "yes" in text_lower:
-            state["step"] = "order_placed"
-            state["flags"]["awaiting_confirmation"] = False
-
-            category = state["scratchpad"].get("category")
-            items = state["scratchpad"].get("items")
-            address = state["scratchpad"].get("address")
-            phone = state["scratchpad"].get("phone")
+            category = state.scratchpad.get("category")
+            items = state.scratchpad.get("items")
+            address = state.scratchpad.get("address")
+            phone = state.scratchpad.get("phone")
 
             reply_text = (
                 "Your food order has been placed!\n"
@@ -244,67 +151,125 @@ def orchestrate(body: Dict[str, Any]):
         else:
             reply_text = "Please answer with 'yes' or 'no'."
 
-    # Fallback
+    # Fallback outside the food flow
     else:
         if any(g in text_lower for g in ["hello", "hi", "hey"]):
-            reply_text = f"Hello, {user_id}! (from MCP Orchestrator)"
+            reply_text = "Hello! I can help you order food. Just say you want to order."
         else:
             reply_text = f"Echo from orchestrator: {text}"
 
-    # --------------------------------------------------
-    #  END OF FLOW LOGIC
-    # --------------------------------------------------
-    latency = time.time() - start
-    LAT.observe(latency)
+    return reply_text, reset_after_reply
 
-    logger.info(
-        "request_end session_id=%s user_id=%s flow=%s step=%s latency=%.4f turn=%s",
-        session_id,
-        user_id,
-        state.get("flow"),
-        state.get("step"),
-        latency,
-        state.get("turn_count"),
-    )
+
+# ----------------- FastAPI app -----------------
+
+
+app = FastAPI(title="MCP Orchestrator – Sync + Loki")
+
+
+@app.get("/health")
+def health_check():
+    # Log health ping
     loki.log(
         "info",
-        "request_end",
-        event="output",
-        user=user_id,
-        channel=channel,
-        session_id=session_id,
-        flow=state.get("flow"),
-        step=state.get("step"),
-        latency=f"{latency:.4f}",
-        turn=state.get("turn_count"),
+        {"event_type": "health"},
+        service_type="orchestrator",
+    )
+    return {"status": "ok", "service": "mcp_orchestrator_sync"}
+
+
+@app.post("/orchestrate", response_model=OrchestrateResponse)
+def orchestrate(req: OrchestrateRequest):
+    start = time.time()
+
+    session_id = req.session_id or f"{req.user_id}:{req.channel}"
+    state = get_session(session_id)
+    state.turn_count += 1
+    state.last_active_at = datetime.now(timezone.utc)
+
+    # Log INPUT
+    loki.log(
+        "info",
+        {
+            "event_type": "input",
+            "user": req.user_id,
+            "channel": req.channel,
+            "session_id": session_id,
+            "turn": state.turn_count,
+            "text": req.text,
+        },
+        flow=state.flow or "none",
+        step=state.step or "none",
+        service_type="orchestrator",
     )
 
-    if reset_after_reply:
-        logger.info("session_reset session_id=%s", session_id)
+    try:
+        reply_text, reset_after = handle_food_flow(req.text, state)
+        latency = time.time() - start
+
+        # Log OUTPUT
         loki.log(
             "info",
-            "session_reset",
-            event="session_reset",
-            session_id=session_id,
-            user=user_id,
+            {
+                "event_type": "output",
+                "user": req.user_id,
+                "channel": req.channel,
+                "session_id": session_id,
+                "turn": state.turn_count,
+                "latency": f"{latency:.3f}",
+                "message": "request_end",
+            },
+            flow=state.flow or "none",
+            step=state.step or "none",
+            service_type="orchestrator",
         )
-        reset_session_state(session_id)
 
-    resp = {
-        "decision": "reply",
-        "reply_text": reply_text,
-        "memory_snapshot": {
-            "session_id": session_id,
-            "turn_count": state.get("turn_count", 0),
-        },
-        "state": {
-            "flow": state.get("flow"),
-            "step": state.get("step"),
-            "scratchpad": state.get("scratchpad", {}),
-            "flags": state.get("flags", {}),
-        },
-        "debug": {
-            "latency_seconds": round(latency, 4),
-        },
-    }
-    return JSONResponse(content=resp)
+        flow_name = state.flow
+        step_name = state.step
+
+        if reset_after:
+            # Log session reset
+            loki.log(
+                "info",
+                {
+                    "event_type": "session_reset",
+                    "user": req.user_id,
+                    "channel": req.channel,
+                    "session_id": session_id,
+                    "reason": "order_complete_or_cancel",
+                },
+                flow=state.flow or "none",
+                step=state.step or "none",
+                service_type="orchestrator",
+            )
+            reset_session(session_id)
+            flow_name = None
+            step_name = None
+
+        return OrchestrateResponse(
+            decision="reply",
+            reply_text=reply_text,
+            flow=flow_name,
+            step=step_name,
+            session_id=session_id,
+        )
+
+    except Exception as e:
+        latency = time.time() - start
+
+        loki.log(
+            "error",
+            {
+                "event_type": "error",
+                "user": req.user_id,
+                "channel": req.channel,
+                "session_id": session_id,
+                "turn": state.turn_count,
+                "latency": f"{latency:.3f}",
+                "error": str(e),
+            },
+            flow=state.flow or "none",
+            step=state.step or "none",
+            service_type="orchestrator",
+        )
+        raise HTTPException(status_code=500, detail="Internal error in orchestrator")

@@ -22,10 +22,15 @@ class LokiLogger:
 
         loki.log(
             "info",
-            {"event_type": "request_start", "session_id": sid},
-            flow="food_order",
-            step="ask_category",
-            service_type="workflow",
+            {
+                "event_type": "input",
+                "user": req.user_id,
+                "channel": req.channel,
+                "session_id": session_id,
+            },
+            flow=ctx.state.flow or "none",
+            step=ctx.state.step or "none",
+            service_type="orchestrator",
         )
     """
 
@@ -47,8 +52,7 @@ class LokiLogger:
         """
         Build Loki 'stream' labels.
 
-        Keep labels LOW cardinality (short, fixed value sets) to avoid
-        blowing up Loki:
+        LOW-cardinality labels only:
           - app
           - level
           - event
@@ -58,20 +62,19 @@ class LokiLogger:
           - intent
           - outcome
 
-        High-cardinality data like session_id, user_id, phone, address
-        stays only in the JSON body.
+        High-card items like session_id remain in JSON body.
         """
         labels = {
             "app": self.app_label,
             "level": level,
         }
 
-        # Event name (e.g. request_start / service_call / session_reset)
+        # Event name (e.g. input/output/error/health/request_start/request_end)
         event = fields.get("event") or fields.get("event_type")
         if event:
             labels["event"] = str(event)
 
-        # Promote a few safe keys as Loki labels
+        # Promote a few keys as Loki labels if present
         mapping = {
             "service_type": "service",
             "service": "service",
@@ -96,17 +99,6 @@ class LokiLogger:
         level   : "info", "warning", "error", etc.
         message : str OR dict
         fields  : extra context: event, flow, step, service_type, session_id, etc.
-
-        Example:
-            loki.log("info", "health_check", event="health")
-
-            loki.log(
-                "info",
-                {"event_type": "request_end", "duration_ms": 123},
-                flow="food_order",
-                step="confirm_order",
-                outcome="success",
-            )
         """
         if not self.enabled:
             return
@@ -117,10 +109,8 @@ class LokiLogger:
         else:
             payload_fields = {**fields, "message": str(message)}
 
-        # Loki expects timestamps in nanoseconds
-        ts_ns = int(time.time() * 1_000_000_000)
+        ts_ns = int(time.time() * 1_000_000_000)  # nanoseconds
 
-        # Loki labels (stream)
         stream_labels = self._build_stream_labels(level, payload_fields)
 
         body = {

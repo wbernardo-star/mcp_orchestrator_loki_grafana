@@ -1,4 +1,4 @@
-#main py ms
+#main sync i/o
 
 from __future__ import annotations
 
@@ -41,7 +41,6 @@ class SessionState(BaseModel):
     last_active_at: Optional[datetime] = None
 
 
-# Very simple in-memory store: {session_id: SessionState}
 SESSION_STORE: Dict[str, SessionState] = {}
 
 
@@ -61,7 +60,7 @@ def reset_session(session_id: str) -> None:
 def handle_food_flow(text: str, state: SessionState) -> (str, bool):
     """
     Returns (reply_text, reset_after_reply_flag).
-    Implements your original hard-coded food ordering flow.
+    Implements your hard-coded food ordering flow.
     """
     text_lower = text.lower().strip()
     reset_after_reply = False
@@ -166,23 +165,23 @@ def handle_food_flow(text: str, state: SessionState) -> (str, bool):
 # ----------------- FastAPI app -----------------
 
 
-app = FastAPI(title="MCP Orchestrator – Sync + Loki (ms latency)")
+app = FastAPI(title="MCP Orchestrator – Sync + Loki (I/O + mode)")
 
 
 @app.get("/health")
 def health_check():
-    # Log health ping
     loki.log(
         "info",
         {"event_type": "health"},
         service_type="orchestrator",
+        sync_mode="sync",   # health is sync check
+        io="none",
     )
     return {"status": "ok", "service": "mcp_orchestrator_sync"}
 
 
 @app.post("/orchestrate", response_model=OrchestrateResponse)
 def orchestrate(req: OrchestrateRequest):
-    # high-resolution timer
     start = time.perf_counter()
 
     session_id = req.session_id or f"{req.user_id}:{req.channel}"
@@ -190,7 +189,7 @@ def orchestrate(req: OrchestrateRequest):
     state.turn_count += 1
     state.last_active_at = datetime.now(timezone.utc)
 
-    # Log INPUT
+    # ---- INPUT log (sync IN) ----
     loki.log(
         "info",
         {
@@ -204,13 +203,15 @@ def orchestrate(req: OrchestrateRequest):
         flow=state.flow or "none",
         step=state.step or "none",
         service_type="orchestrator",
+        sync_mode="sync",
+        io="in",
     )
 
     try:
         reply_text, reset_after = handle_food_flow(req.text, state)
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
-        # Log OUTPUT
+        # ---- OUTPUT log (sync OUT) ----
         loki.log(
             "info",
             {
@@ -225,13 +226,15 @@ def orchestrate(req: OrchestrateRequest):
             flow=state.flow or "none",
             step=state.step or "none",
             service_type="orchestrator",
+            sync_mode="sync",
+            io="out",
         )
 
         flow_name = state.flow
         step_name = state.step
 
         if reset_after:
-            # Log session reset
+            # ---- Session reset log ----
             loki.log(
                 "info",
                 {
@@ -245,6 +248,8 @@ def orchestrate(req: OrchestrateRequest):
                 flow=state.flow or "none",
                 step=state.step or "none",
                 service_type="orchestrator",
+                sync_mode="sync",
+                io="none",
             )
             reset_session(session_id)
             flow_name = None
@@ -275,5 +280,7 @@ def orchestrate(req: OrchestrateRequest):
             flow=state.flow or "none",
             step=state.step or "none",
             service_type="orchestrator",
+            sync_mode="sync",
+            io="none",
         )
         raise HTTPException(status_code=500, detail="Internal error in orchestrator")

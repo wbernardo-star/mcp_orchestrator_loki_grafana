@@ -1,3 +1,5 @@
+#Loki Py MS
+
 import os
 import time
 import json
@@ -18,7 +20,7 @@ class LokiLogger:
 
         from .logging_loki import loki
 
-        loki.log("info", "health_check", event="health")
+        loki.log("info", {"event_type": "health"}, service_type="orchestrator")
 
         loki.log(
             "info",
@@ -27,9 +29,11 @@ class LokiLogger:
                 "user": req.user_id,
                 "channel": req.channel,
                 "session_id": session_id,
+                "turn": state.turn_count,
+                "text": req.text,
             },
-            flow=ctx.state.flow or "none",
-            step=ctx.state.step or "none",
+            flow=state.flow or "none",
+            step=state.step or "none",
             service_type="orchestrator",
         )
     """

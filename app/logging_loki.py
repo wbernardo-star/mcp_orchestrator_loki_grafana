@@ -1,46 +1,155 @@
-
 import os
 import time
+import json
 import requests
+
 
 class LokiLogger:
     """
-    Small helper to push logs to Grafana Cloud Loki.
+    Helper to push structured logs to Grafana Loki.
 
-    Uses env vars:
-      - GRAFANA_LOKI_URL      (e.g. https://logs-prod-025.grafana.net/loki/api/v1/push)
-      - GRAFANA_LOKI_USERNAME (tenant / user ID)
-      - GRAFANA_LOKI_API_TOKEN (API token with logs:write)
+    Env vars:
+      - GRAFANA_LOKI_URL       e.g. https://logs-prod-025.grafana.net/loki/api/v1/push
+      - GRAFANA_LOKI_USERNAME  e.g. 1401328  (tenant / user ID)
+      - GRAFANA_LOKI_API_TOKEN token with logs:write
+      - MCP_APP_LABEL          (optional) app label, default "mcp_orchestrator_sync"
+
+    Usage from main.py:
+
+        from .logging_loki import loki
+
+        loki.log("info", "health_check", event="health")
+
+        loki.log(
+            "info",
+            {"event_type": "request_start", "session_id": sid},
+            flow="food_order",
+            step="ask_category",
+            service_type="workflow",
+        )
     """
-    def __init__(self):
+
+    def __init__(self) -> None:
         self.url = os.getenv("GRAFANA_LOKI_URL")
         self.username = os.getenv("GRAFANA_LOKI_USERNAME")
         self.token = os.getenv("GRAFANA_LOKI_API_TOKEN")
+        self.app_label = os.getenv("MCP_APP_LABEL", "mcp_orchestrator_sync")
+
         self.enabled = all([self.url, self.username, self.token])
         if not self.enabled:
-            print("[LokiLogger] Disabled (missing env vars).")
+            print("[LokiLogger] Disabled – missing GRAFANA_LOKI_* env vars")
         else:
             print("[LokiLogger] Enabled, pushing to", self.url)
 
-    def log(self, level, message, **labels):
+    # ----------------- internal helpers -----------------
+
+    def _build_stream_labels(self, level: str, fields: dict) -> dict:
+        """
+        Build Loki 'stream' labels.
+
+        Keep labels LOW cardinality (short, fixed value sets) to avoid
+        blowing up Loki:
+          - app
+          - level
+          - event
+          - service
+          - flow
+          - step
+          - intent
+          - outcome
+
+        High-cardinality data like session_id, user_id, phone, address
+        stays only in the JSON body.
+        """
+        labels = {
+            "app": self.app_label,
+            "level": level,
+        }
+
+        # Event name (e.g. request_start / service_call / session_reset)
+        event = fields.get("event") or fields.get("event_type")
+        if event:
+            labels["event"] = str(event)
+
+        # Promote a few safe keys as Loki labels
+        mapping = {
+            "service_type": "service",
+            "service": "service",
+            "flow": "flow",
+            "step": "step",
+            "intent": "intent",
+            "outcome": "outcome",
+        }
+        for src, dst in mapping.items():
+            val = fields.get(src)
+            if val not in (None, "", []):
+                labels[dst] = str(val)
+
+        return labels
+
+    # ----------------- public API -----------------
+
+    def log(self, level: str, message, **fields) -> None:
+        """
+        Main logging function used by the rest of the app.
+
+        level   : "info", "warning", "error", etc.
+        message : str OR dict
+        fields  : extra context: event, flow, step, service_type, session_id, etc.
+
+        Example:
+            loki.log("info", "health_check", event="health")
+
+            loki.log(
+                "info",
+                {"event_type": "request_end", "duration_ms": 123},
+                flow="food_order",
+                step="confirm_order",
+                outcome="success",
+            )
+        """
         if not self.enabled:
             return
-        stream_labels = {"app": "mcp_orchestrator_sync", "level": level}
-        stream_labels.update({k: str(v) for k, v in labels.items() if v is not None})
-        ts_ns = int(time.time() * 1e9)
-        payload = {
+
+        # Build structured JSON body
+        if isinstance(message, dict):
+            payload_fields = {**fields, **message}
+        else:
+            payload_fields = {**fields, "message": str(message)}
+
+        # Loki expects timestamps in nanoseconds
+        ts_ns = int(time.time() * 1_000_000_000)
+
+        # Loki labels (stream)
+        stream_labels = self._build_stream_labels(level, payload_fields)
+
+        body = {
             "streams": [
                 {
                     "stream": stream_labels,
-                    "values": [[str(ts_ns), message]]
+                    "values": [
+                        [str(ts_ns), json.dumps(payload_fields, ensure_ascii=False)]
+                    ],
                 }
             ]
         }
-        try:
-            resp = requests.post(self.url, auth=(self.username, self.token), json=payload, timeout=4)
-            if resp.status_code not in (200, 204):
-                print("[LokiLogger] Push failed:", resp.status_code, resp.text[:200])
-        except Exception as e:
-            print("[LokiLogger] Exception:", e)
 
+        try:
+            resp = requests.post(
+                self.url,
+                auth=(self.username, self.token),
+                json=body,
+                timeout=4,
+            )
+            if resp.status_code not in (200, 204):
+                print(
+                    "[LokiLogger] Push failed:",
+                    resp.status_code,
+                    resp.text[:200],
+                )
+        except Exception as e:
+            print("[LokiLogger] Exception while pushing to Loki:", e)
+
+
+# Global logger used by main.py
 loki = LokiLogger()

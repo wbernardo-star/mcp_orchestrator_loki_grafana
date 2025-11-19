@@ -1,0 +1,126 @@
+{
+  "id": null,
+  "uid": "mcp-loki-dashboard",
+  "title": "MCP Orchestrator \u2013 Loki Logs",
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "MCP Logs (Raw)",
+      "type": "logs",
+      "datasource": {
+        "type": "loki",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 15,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": true,
+        "showCommonLabels": true,
+        "showLabels": true,
+        "showTime": true,
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "expr": "{app=\"mcp_orchestrator_sync\"}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Requests per minute (event = input)",
+      "type": "timeseries",
+      "datasource": {
+        "type": "loki",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 15
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "req/min"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (app) (rate({app=\"mcp_orchestrator_sync\", event=\"input\"}[1m]))",
+          "legendFormat": "requests/min"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Events by type (input / output / error / session_reset)",
+      "type": "barchart",
+      "datasource": {
+        "type": "loki",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 15
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom"
+        },
+        "orientation": "horizontal"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (event) (count_over_time({app=\"mcp_orchestrator_sync\"}[5m]))",
+          "legendFormat": "{{event}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "loki",
+        "label": "Loki datasource",
+        "current": {},
+        "refresh": 1
+      }
+    ]
+  },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  }
+}

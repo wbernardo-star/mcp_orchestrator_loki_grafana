@@ -1,3 +1,5 @@
+#main py ms
+
 from __future__ import annotations
 
 import time
@@ -164,7 +166,7 @@ def handle_food_flow(text: str, state: SessionState) -> (str, bool):
 # ----------------- FastAPI app -----------------
 
 
-app = FastAPI(title="MCP Orchestrator – Sync + Loki")
+app = FastAPI(title="MCP Orchestrator – Sync + Loki (ms latency)")
 
 
 @app.get("/health")
@@ -180,7 +182,8 @@ def health_check():
 
 @app.post("/orchestrate", response_model=OrchestrateResponse)
 def orchestrate(req: OrchestrateRequest):
-    start = time.time()
+    # high-resolution timer
+    start = time.perf_counter()
 
     session_id = req.session_id or f"{req.user_id}:{req.channel}"
     state = get_session(session_id)
@@ -205,7 +208,7 @@ def orchestrate(req: OrchestrateRequest):
 
     try:
         reply_text, reset_after = handle_food_flow(req.text, state)
-        latency = time.time() - start
+        latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
         # Log OUTPUT
         loki.log(
@@ -216,7 +219,7 @@ def orchestrate(req: OrchestrateRequest):
                 "channel": req.channel,
                 "session_id": session_id,
                 "turn": state.turn_count,
-                "latency": f"{latency:.3f}",
+                "latency_ms": latency_ms,
                 "message": "request_end",
             },
             flow=state.flow or "none",
@@ -236,6 +239,7 @@ def orchestrate(req: OrchestrateRequest):
                     "user": req.user_id,
                     "channel": req.channel,
                     "session_id": session_id,
+                    "latency_ms": latency_ms,
                     "reason": "order_complete_or_cancel",
                 },
                 flow=state.flow or "none",
@@ -255,7 +259,7 @@ def orchestrate(req: OrchestrateRequest):
         )
 
     except Exception as e:
-        latency = time.time() - start
+        latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
         loki.log(
             "error",
@@ -265,7 +269,7 @@ def orchestrate(req: OrchestrateRequest):
                 "channel": req.channel,
                 "session_id": session_id,
                 "turn": state.turn_count,
-                "latency": f"{latency:.3f}",
+                "latency_ms": latency_ms,
                 "error": str(e),
             },
             flow=state.flow or "none",

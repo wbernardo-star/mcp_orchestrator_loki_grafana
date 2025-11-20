@@ -1,15 +1,16 @@
-#main sync i/o
+#async main.py
 
 from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from .logging_loki import loki
+from .menu_service import fetch_menu  # <-- NEW IMPORT
 
 
 # ----------------- Models -----------------
@@ -57,10 +58,16 @@ def reset_session(session_id: str) -> None:
 # ----------------- Food-ordering core -----------------
 
 
-def handle_food_flow(text: str, state: SessionState) -> (str, bool):
+def handle_food_flow(
+    text: str,
+    state: SessionState,
+    user_id: str,
+    channel: str,
+    session_id: str,
+) -> Tuple[str, bool]:
     """
     Returns (reply_text, reset_after_reply_flag).
-    Implements your hard-coded food ordering flow.
+    Implements your hard-coded food ordering flow, extended to call menu_service.
     """
     text_lower = text.lower().strip()
     reset_after_reply = False
@@ -72,6 +79,11 @@ def handle_food_flow(text: str, state: SessionState) -> (str, bool):
         state.flow = "food_order"
         state.step = "ask_category"
         state.scratchpad["awaiting_category"] = "1"
+
+        # 🔹 Call the Menu Service (async-style service)
+        menu_json = fetch_menu(user_id=user_id, channel=channel, session_id=session_id)
+        state.scratchpad["menu"] = menu_json  # stored as JSON; can be used later
+
         reply_text = (
             "Nice, let's order some food!\n"
             "What type of food would you like? (example. pizza, burger, salad, chicken, ramen)"
@@ -165,7 +177,7 @@ def handle_food_flow(text: str, state: SessionState) -> (str, bool):
 # ----------------- FastAPI app -----------------
 
 
-app = FastAPI(title="MCP Orchestrator – Sync + Loki (I/O + mode)")
+app = FastAPI(title="MCP Orchestrator – Sync + Loki + Menu Service")
 
 
 @app.get("/health")
@@ -174,7 +186,7 @@ def health_check():
         "info",
         {"event_type": "health"},
         service_type="orchestrator",
-        sync_mode="sync",   # health is sync check
+        sync_mode="sync",
         io="none",
     )
     return {"status": "ok", "service": "mcp_orchestrator_sync"}
@@ -208,7 +220,13 @@ def orchestrate(req: OrchestrateRequest):
     )
 
     try:
-        reply_text, reset_after = handle_food_flow(req.text, state)
+        reply_text, reset_after = handle_food_flow(
+            text=req.text,
+            state=state,
+            user_id=req.user_id,
+            channel=req.channel,
+            session_id=session_id,
+        )
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
         # ---- OUTPUT log (sync OUT) ----
@@ -234,7 +252,6 @@ def orchestrate(req: OrchestrateRequest):
         step_name = state.step
 
         if reset_after:
-            # ---- Session reset log ----
             loki.log(
                 "info",
                 {

@@ -16,21 +16,6 @@ def fetch_menu(user_id: str, channel: str, session_id: str) -> Dict[str, Any]:
     """
     Fetch the restaurant menu from an external service (e.g. n8n webhook, REST API).
 
-    Expected to return a JSON like:
-    {
-      "restaurant": "Blink's Pizza",
-      "categories": [
-        {
-          "name": "Pizza",
-          "items": [
-            {"name": "Pepperoni", "price": 12.99},
-            {"name": "Margherita", "price": 11.49}
-          ]
-        },
-        ...
-      ]
-    }
-
     We treat this as an ASYNC-style service in logging:
       sync_mode = "async"
       io       = "out" (call) / "in" (response)
@@ -71,13 +56,28 @@ def fetch_menu(user_id: str, channel: str, session_id: str) -> Dict[str, Any]:
     )
 
     try:
-        resp = requests.get(MENU_SERVICE_URL, timeout=5.0)
+        # ✅ use POST, not GET
+        payload = {
+            "action": "get_menu",
+            "user_id": user_id,
+            "channel": channel,
+            "session_id": session_id,
+        }
+
+        resp = requests.post(
+            MENU_SERVICE_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=10.0,
+        )
         resp.raise_for_status()
         data = resp.json()
 
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
         # ---- INCOMING RESPONSE LOG (async IN) ----
+        # If your workflow returns just { "output": "<menu text>" }
+        # categories will be empty, which is fine for now.
         categories = data.get("categories", [])
         loki.log(
             "info",

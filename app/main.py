@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import json
 from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple
 
@@ -62,46 +63,93 @@ def extract_menu_text(menu_payload: Dict) -> str:
     """
     Extract a human-readable menu text from the menu_service (n8n) response.
 
-    Supports shapes like:
-      { "output": "Here is the menu ..." }
-      { "menu": "..." }
-      { "categories": [ { "name": "...", "items": [...] }, ... ] }
+    Handles several shapes:
+
+      1) { "output": "Here is the menu ..." }         # AI Agent / Respond-to-Webhook
+      2) { "menu": "..." }                            # Simple text
+      3) { "categories": [ {...}, ... ] }             # Structured categories
+      4) [ {...}, ... ]                               # Bare list → treat as categories
+      5) Fallback: dump raw JSON (for debugging)
     """
 
-    if not isinstance(menu_payload, dict):
-        return ""
+    # If n8n somehow returned a list directly, normalize to {"categories": list}
+    if isinstance(menu_payload, list):
+        data = {"categories": menu_payload}
+    elif isinstance(menu_payload, dict):
+        data = menu_payload
+    else:
+        return "Menu format not recognized (non-JSON response)."
 
-    # 1) AI / Respond-to-webhook style
-    if isinstance(menu_payload.get("output"), str):
-        return menu_payload["output"].strip()
+    # ---- Case 1: direct text fields ----
+    if isinstance(data.get("output"), str):
+        return data["output"].strip()
 
-    # 2) Alternate explicit key
-    if isinstance(menu_payload.get("menu"), str):
-        return menu_payload["menu"].strip()
+    if isinstance(data.get("menu"), str):
+        return data["menu"].strip()
 
-    # 3) Structured categories → build a simple text
-    if "categories" in menu_payload:
-        try:
-            cats = menu_payload["categories"]
-            lines = []
-            for c in cats:
-                if not isinstance(c, dict):
-                    continue
-                name = c.get("name", "Category")
-                items = c.get("items") or []
-                item_names = ", ".join(
-                    i.get("name", "") for i in items if isinstance(i, dict)
-                )
-                if item_names:
-                    lines.append(f"{name}: {item_names}")
-                else:
-                    lines.append(name)
-            if lines:
-                return "Here is the menu:\n" + "\n".join(lines)
-        except Exception:
-            pass
+    # ---- Case 2: structured categories ----
+    # Try multiple likely keys for categories:
+    #   "categories", "data", "menu_items", "items"
+    categories = (
+        data.get("categories")
+        or data.get("data")
+        or data.get("menu_items")
+        or data.get("items")
+    )
 
-    return ""
+    if isinstance(categories, list) and categories:
+        lines = ["Here is the menu:"]
+        for cat in categories:
+            if not isinstance(cat, dict):
+                continue
+
+            # Category name / group
+            cname = (
+                cat.get("name")
+                or cat.get("category")
+                or cat.get("title")
+                or "Category"
+            )
+            lines.append(f"📌 {cname}:")
+
+            # Items inside category – try several field names
+            items = (
+                cat.get("items")
+                or cat.get("products")
+                or cat.get("dishes")
+                or []
+            )
+            if isinstance(items, list) and items:
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    nm = (
+                        item.get("name")
+                        or item.get("title")
+                        or "Item"
+                    )
+                    price = (
+                        item.get("price")
+                        or item.get("priceLabel")
+                        or item.get("amount")
+                    )
+                    if price:
+                        lines.append(f"   • {nm} — {price}")
+                    else:
+                        lines.append(f"   • {nm}")
+            else:
+                # No nested items, just list the category name
+                lines.append("   • (no items listed)")
+            lines.append("")  # blank line between categories
+
+        return "\n".join(lines).strip()
+
+    # ---- Case 3: fallback – show raw JSON so we can see what n8n sends ----
+    try:
+        raw = json.dumps(menu_payload, indent=2)
+        return "Here is the raw menu payload I received:\n" + raw[:1500]
+    except Exception:
+        return "Menu format not recognized."
 
 
 # ----------------- Food-ordering core logic -----------------

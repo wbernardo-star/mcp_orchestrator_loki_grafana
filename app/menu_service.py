@@ -1,4 +1,4 @@
-# app/menu_service.py NEW
+# app/menu_service.py
 
 import os
 import time

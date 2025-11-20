@@ -65,14 +65,30 @@ def extract_menu_text(menu_payload: Dict) -> str:
 
     Handles several shapes:
 
-      1) { "output": "Here is the menu ..." }         # AI Agent / Respond-to-Webhook
-      2) { "menu": "..." }                            # Simple text
-      3) { "categories": [ {...}, ... ] }             # Structured categories
-      4) [ {...}, ... ]                               # Bare list → treat as categories
-      5) Fallback: dump raw JSON (for debugging)
+      1) { "output": "Here is the menu ..." }         # possibly nested
+      2) { "menu": "..." }                            # simple text
+      3) { "categories": [ {...}, ... ] }             # structured categories
+      4) [ {...}, ... ]                               # bare list → treat as categories
+      5) Fallback: pretty-print raw JSON
     """
 
-    # If n8n somehow returned a list directly, normalize to {"categories": list}
+    # ---------- helper: recursively find "output" string anywhere ----------
+    def _find_output_str(obj):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(k, str) and k.lower() == "output" and isinstance(v, str):
+                    return v
+                found = _find_output_str(v)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for item in obj:
+                found = _find_output_str(item)
+                if found:
+                    return found
+        return None
+
+    # Normalize payload
     if isinstance(menu_payload, list):
         data = {"categories": menu_payload}
     elif isinstance(menu_payload, dict):
@@ -80,16 +96,16 @@ def extract_menu_text(menu_payload: Dict) -> str:
     else:
         return "Menu format not recognized (non-JSON response)."
 
-    # ---- Case 1: direct text fields ----
-    if isinstance(data.get("output"), str):
-        return data["output"].strip()
+    # ---- Case 1: any nested `output` field wins ----
+    nested_output = _find_output_str(data)
+    if nested_output:
+        return nested_output.strip()
 
+    # ---- Case 2: direct text field `menu` ----
     if isinstance(data.get("menu"), str):
         return data["menu"].strip()
 
-    # ---- Case 2: structured categories ----
-    # Try multiple likely keys for categories:
-    #   "categories", "data", "menu_items", "items"
+    # ---- Case 3: structured categories ----
     categories = (
         data.get("categories")
         or data.get("data")
@@ -103,7 +119,6 @@ def extract_menu_text(menu_payload: Dict) -> str:
             if not isinstance(cat, dict):
                 continue
 
-            # Category name / group
             cname = (
                 cat.get("name")
                 or cat.get("category")
@@ -112,7 +127,6 @@ def extract_menu_text(menu_payload: Dict) -> str:
             )
             lines.append(f"📌 {cname}:")
 
-            # Items inside category – try several field names
             items = (
                 cat.get("items")
                 or cat.get("products")
@@ -138,19 +152,18 @@ def extract_menu_text(menu_payload: Dict) -> str:
                     else:
                         lines.append(f"   • {nm}")
             else:
-                # No nested items, just list the category name
+                # No nested items; just show category name
                 lines.append("   • (no items listed)")
-            lines.append("")  # blank line between categories
+            lines.append("")
 
         return "\n".join(lines).strip()
 
-    # ---- Case 3: fallback – show raw JSON so we can see what n8n sends ----
+    # ---- Case 4: fallback – just show raw JSON so we can see what n8n sent ----
     try:
         raw = json.dumps(menu_payload, indent=2)
         return "Here is the raw menu payload I received:\n" + raw[:1500]
     except Exception:
         return "Menu format not recognized."
-
 
 # ----------------- Food-ordering core logic -----------------
 

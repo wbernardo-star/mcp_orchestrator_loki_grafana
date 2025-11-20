@@ -1,5 +1,9 @@
 # app/main.py Enhanced AI Response
 
+from fastapi import FastAPI
+
+app = FastAPI (title="BlinksBuy MCP Orchestrator Food Ordering")
+
 import os
 import time
 from typing import Dict, Any

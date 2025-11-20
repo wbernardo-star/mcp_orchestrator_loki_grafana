@@ -13,7 +13,7 @@ from .logging_loki import loki
 from .menu_service import fetch_menu
 
 
-# ----------------- Models -----------------
+# ----------------- Pydantic models -----------------
 
 
 class OrchestrateRequest(BaseModel):
@@ -31,7 +31,7 @@ class OrchestrateResponse(BaseModel):
     session_id: str
 
 
-# ----------------- Simple in-memory Session Context -----------------
+# ----------------- Simple in-memory session state -----------------
 
 
 class SessionState(BaseModel):
@@ -62,23 +62,24 @@ def extract_menu_text(menu_payload: Dict) -> str:
     """
     Extract a human-readable menu text from the menu_service (n8n) response.
 
-    Your n8n Respond to Webhook is likely returning something like:
-      { "output": "Here is the menu for Blink Burgers ..." }
-
-    We support a few common shapes and fall back gracefully.
+    Supports shapes like:
+      { "output": "Here is the menu ..." }
+      { "menu": "..." }
+      { "categories": [ { "name": "...", "items": [...] }, ... ] }
     """
+
     if not isinstance(menu_payload, dict):
         return ""
 
-    # 1) Format used by many AI Agent / Respond-to-webhook setups
+    # 1) AI / Respond-to-webhook style
     if isinstance(menu_payload.get("output"), str):
         return menu_payload["output"].strip()
 
-    # 2) Alternate explicit field
+    # 2) Alternate explicit key
     if isinstance(menu_payload.get("menu"), str):
         return menu_payload["menu"].strip()
 
-    # 3) Structured categories — future possibility
+    # 3) Structured categories → build a simple text
     if "categories" in menu_payload:
         try:
             cats = menu_payload["categories"]
@@ -98,13 +99,12 @@ def extract_menu_text(menu_payload: Dict) -> str:
             if lines:
                 return "Here is the menu:\n" + "\n".join(lines)
         except Exception:
-            # Fallback to empty if something goes wrong
             pass
 
     return ""
 
 
-# ----------------- Food-ordering core -----------------
+# ----------------- Food-ordering core logic -----------------
 
 
 def handle_food_flow(
@@ -116,15 +116,16 @@ def handle_food_flow(
 ) -> Tuple[str, bool]:
     """
     Returns (reply_text, reset_after_reply_flag).
-    Implements your hard-coded food ordering flow,
-    now extended to use menu_service when appropriate.
+
+    Implements:
+      • Menu-only branch (does NOT change flow/step)
+      • Stateful food ordering flow
     """
     text_lower = text.lower().strip()
     reset_after_reply = False
 
     # ============================================================
-    #  MENU-ONLY BRANCH (does NOT change flow/state)
-    #  e.g. "get the menu", "show me the menu"
+    #  MENU-ONLY BRANCH  (no state change)
     # ============================================================
     if any(
         kw in text_lower
@@ -152,15 +153,14 @@ def handle_food_flow(
                 "Please try again in a moment."
             )
 
-        # NOTE: We do NOT modify state.flow or state.step here.
-        # This is a pure “answer the menu” behavior.
+        # Do NOT modify state.flow / state.step here
         return reply_text, False
 
     # ============================================================
     #  SIMPLE STATEFUL FOOD ORDERING FLOW (BEGIN)
     # ============================================================
 
-    # 1) Start the food ordering flow
+    # 1) Start the flow
     if state.flow is None and any(
         kw in text_lower for kw in ["order", "food", "pizza", "burger", "menu", "cravings"]
     ):
@@ -168,7 +168,7 @@ def handle_food_flow(
         state.step = "ask_category"
         state.scratchpad["awaiting_category"] = "1"
 
-        # Optional pre-fetch of menu (async-style service)
+        # Optional: pre-fetch menu and store
         menu_payload = fetch_menu(
             user_id=user_id,
             channel=channel,
@@ -178,7 +178,6 @@ def handle_food_flow(
         menu_text = extract_menu_text(menu_payload)
 
         if menu_text:
-            # Combine menu text with the next question
             reply_text = (
                 menu_text
                 + "\n\nNow, what type of food would you like? "
@@ -191,7 +190,7 @@ def handle_food_flow(
                 "(For example: pizza, burger, salad, chicken, ramen.)"
             )
 
-    # 2) Ask category (pizza, burger, etc.)
+    # 2) Category
     elif state.flow == "food_order" and state.step == "ask_category":
         state.scratchpad["category"] = text
         state.step = "collect_items"
@@ -203,7 +202,7 @@ def handle_food_flow(
             "Example: '1 large pepperoni, 1 garlic bread'."
         )
 
-    # 3) Collect food items
+    # 3) Items
     elif state.flow == "food_order" and state.step == "collect_items":
         state.scratchpad["items"] = text
         state.step = "ask_address"
@@ -211,7 +210,7 @@ def handle_food_flow(
         state.scratchpad["awaiting_address"] = "1"
         reply_text = "Got it!\nNext, what's the delivery address?"
 
-    # 4) Ask for address
+    # 4) Address
     elif state.flow == "food_order" and state.step == "ask_address":
         state.scratchpad["address"] = text
         state.step = "ask_phone"
@@ -219,7 +218,7 @@ def handle_food_flow(
         state.scratchpad["awaiting_phone"] = "1"
         reply_text = "Great — and what phone number should the driver call?"
 
-    # 5) Ask for phone number
+    # 5) Phone
     elif state.flow == "food_order" and state.step == "ask_phone":
         state.scratchpad["phone"] = text
         state.step = "confirm_order"
@@ -240,7 +239,7 @@ def handle_food_flow(
             "Would you like to place this order? Please say Yes to confirm or No to cancel."
         )
 
-    # 6) Final confirmation
+    # 6) Confirmation
     elif state.flow == "food_order" and state.step == "confirm_order":
         if "yes" in text_lower:
             category = state.scratchpad.get("category")
@@ -271,8 +270,8 @@ def handle_food_flow(
     #  SIMPLE STATEFUL FOOD ORDERING FLOW (END)
     # ============================================================
 
-    # Fallback outside the food flow
     else:
+        # Fallback outside flow
         if any(g in text_lower for g in ["hello", "hi", "hey"]):
             reply_text = (
                 "Hello! I can help you order food or read the menu. "

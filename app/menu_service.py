@@ -1,4 +1,4 @@
-# app/menu_service.py
+# app/menu_service.py NEW
 
 import os
 import time
@@ -9,6 +9,7 @@ import requests
 from .logging_loki import loki
 
 
+# n8n webhook / external menu service URL
 MENU_SERVICE_URL = os.getenv("MENU_SERVICE_URL")
 
 
@@ -16,13 +17,17 @@ def fetch_menu(user_id: str, channel: str, session_id: str) -> Dict[str, Any]:
     """
     Fetch the restaurant menu from an external service (e.g. n8n webhook, REST API).
 
+    The external service might return:
+      - A dict, e.g. { "output": "...", "categories": [...] }
+      - OR a list, e.g. [ { "name": "Pizza", "items": [...] }, ... ]
+
     We treat this as an ASYNC-style service in logging:
       sync_mode = "async"
       io       = "out" (call) / "in" (response)
     """
 
     if not MENU_SERVICE_URL:
-        # Menu is not configured; log and return empty.
+        # Menu is not configured; log and return empty menu
         loki.log(
             "warning",
             {
@@ -56,7 +61,7 @@ def fetch_menu(user_id: str, channel: str, session_id: str) -> Dict[str, Any]:
     )
 
     try:
-        # ✅ use POST, not GET
+        # n8n webhook is POST-based
         payload = {
             "action": "get_menu",
             "user_id": user_id,
@@ -76,9 +81,19 @@ def fetch_menu(user_id: str, channel: str, session_id: str) -> Dict[str, Any]:
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
         # ---- INCOMING RESPONSE LOG (async IN) ----
-        # If your workflow returns just { "output": "<menu text>" }
-        # categories will be empty, which is fine for now.
-        categories = data.get("categories", [])
+        # Robust handling for dict OR list
+        if isinstance(data, dict):
+            categories_field = data.get("categories", [])
+            if isinstance(categories_field, list):
+                category_count = len(categories_field)
+            else:
+                category_count = 0
+        elif isinstance(data, list):
+            # Bare list → treat it as categories
+            category_count = len(data)
+        else:
+            category_count = 0
+
         loki.log(
             "info",
             {
@@ -87,13 +102,16 @@ def fetch_menu(user_id: str, channel: str, session_id: str) -> Dict[str, Any]:
                 "channel": channel,
                 "session_id": session_id,
                 "latency_ms": latency_ms,
-                "menu_category_count": len(categories),
+                "menu_category_count": category_count,
             },
             service_type="menu_service",
             sync_mode="async",
             io="in",
         )
 
+        # Always return a dict so extract_menu_text can handle it
+        if isinstance(data, list):
+            return {"categories": data}
         return data
 
     except Exception as e:

@@ -53,101 +53,79 @@ def get_session(session_id: str) -> SessionState:
 
 
 # ----------------- Helpers -----------------
-
-
 def extract_menu_text(menu_payload: Dict) -> str:
     """
     Extract a human-readable menu text from the menu_service (n8n) response.
 
     Supports shapes like:
-      { "output": "Here is the menu ..." }                # AI agent style
-      { "menu": "..." }                                   # explicit key
-      { "categories": [ { name, items[...] } ] }          # structured list
-      { "categories": { "Mains": [...], "Drinks": [...]}} # structured dict
+      { "output": "Here is the menu ..." }      # AI agent style
+      { "menu": "..." }                         # explicit key
+      { "categories": [ { name, items[...] } ]} # structured menu
+
+    If structured parsing fails, we fall back to:
+      - the longest string anywhere in the JSON payload.
     """
+
     if not isinstance(menu_payload, dict):
         return ""
 
-    # 1) Simple text-style outputs
+    # 1) AI / Respond-to-webhook style
     if isinstance(menu_payload.get("output"), str):
         return menu_payload["output"].strip()
 
+    # 2) Alternate explicit key
     if isinstance(menu_payload.get("menu"), str):
         return menu_payload["menu"].strip()
 
-    # 2) Structured categories
-    cats = menu_payload.get("categories")
-    if not cats:
-        return ""
-
-    lines: list[str] = []
-
-    # 2a) categories as a dict: { "Mains": [...], "Drinks": [...] }
-    if isinstance(cats, dict):
-        for cat_name, items in cats.items():
-            item_names = ""
-            if isinstance(items, list):
+    # 3) Structured categories → build a simple text
+    if "categories" in menu_payload:
+        try:
+            cats = menu_payload["categories"]
+            lines = []
+            for c in cats:
+                if not isinstance(c, dict):
+                    continue
+                name = c.get("name", "Category")
+                items = c.get("items") or []
                 item_names = ", ".join(
-                    (i.get("name") if isinstance(i, dict) else str(i))
-                    for i in items
+                    i.get("name", "") for i in items if isinstance(i, dict)
                 )
-            else:
-                item_names = str(items) if items is not None else ""
-
-            if item_names:
-                lines.append(f"{cat_name}: {item_names}")
-            else:
-                lines.append(str(cat_name))
-
-    # 2b) categories as a list
-    elif isinstance(cats, list):
-        for c in cats:
-            # category as plain string
-            if isinstance(c, str):
-                lines.append(c)
-                continue
-
-            if not isinstance(c, dict):
-                continue
-
-            name = (
-                c.get("name")
-                or c.get("category")
-                or c.get("title")
-                or "Category"
-            )
-
-            items = (
-                c.get("items")
-                or c.get("menu_items")
-                or c.get("dishes")
-                or []
-            )
-
-            # items may be list of dicts or list of strings or a single string
-            item_names = ""
-            if isinstance(items, list):
-                item_names = ", ".join(
-                    (i.get("name") if isinstance(i, dict) else str(i))
-                    for i in items
-                )
-            elif items:
-                item_names = str(items)
-
-            if item_names:
-                lines.append(f"{name}: {item_names}")
-            else:
-                # maybe we have description/text instead of explicit items
-                desc = c.get("description") or c.get("text")
-                if desc:
-                    lines.append(f"{name}: {desc}")
+                if item_names:
+                    lines.append(f"{name}: {item_names}")
                 else:
                     lines.append(name)
 
-    if lines:
-        return "Here is the menu:\n" + "\n".join(lines)
+            # If we got something more meaningful than a single default "Category"
+            if lines and not (len(lines) == 1 and lines[0] == "Category"):
+                return "Here is the menu:\n" + "\n ".join(lines)
+        except Exception:
+            # fall through to generic fallback
+            pass
 
+    # 4) Generic fallback: find the longest string anywhere in the JSON structure
+    def _walk_and_collect_strings(node):
+        strings = []
+        if isinstance(node, str):
+            strings.append(node)
+        elif isinstance(node, dict):
+            for v in node.values():
+                strings.extend(_walk_and_collect_strings(v))
+        elif isinstance(node, list):
+            for v in node:
+                strings.extend(_walk_and_collect_strings(v))
+        return strings
+
+    all_strings = _walk_and_collect_strings(menu_payload)
+    if all_strings:
+        # Pick the longest string – typically the big menu paragraph
+        longest = max(all_strings, key=len).strip()
+        if longest:
+            return longest
+
+    # Nothing useful found
     return ""
+
+
 
 # ----------------- FastAPI app -----------------
 

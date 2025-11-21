@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from .logging_loki import loki
 from .menu_service import fetch_menu
-from .intent_service import classify_intent  # NEW
+from .intent_service import classify_intent  # LLM-based intent classifier
 
 
 # ----------------- Pydantic models -----------------
@@ -110,9 +110,10 @@ app = FastAPI(title="MCP Orchestrator – Thin Sync (Intent + Menu microservice)
 
 @app.get("/health")
 def health_check():
+    # NOTE: using positional args for LokiLogger.log(level, message, **labels)
     loki.log(
-        level="info",
-        payload={"event_type": "health"},
+        "info",
+        {"event_type": "health"},
         service_type="orchestrator",
         sync_mode="sync",
         io="none",
@@ -130,18 +131,39 @@ def orchestrate(req: OrchestrateRequest):
     state.turn_count += 1
     state.last_active_at = datetime.now(timezone.utc)
 
-    # 2) Call internal LLM intent service (instead of keyword detect_route)
-    #    For now we don't keep history; you can add it later if needed.
-    intent_result = classify_intent(
-        text=req.text,
-        user_id=req.user_id,
-        channel=req.channel,
-        session_id=session_id,
-        history=None,
-    )
-    intent = intent_result.intent  # "menu", "order", "greeting", "smalltalk", "unknown"
+    # 2) Safe defaults for intent in case intent_service fails
+    intent: str = "unknown"
+    intent_confidence: Optional[float] = None
 
-    # 3) Map intent → route
+    # 3) Call internal LLM intent service (instead of keyword detect_route)
+    try:
+        intent_result = classify_intent(
+            text=req.text,
+            user_id=req.user_id,
+            channel=req.channel,
+            session_id=session_id,
+            history=None,  # you can pass short history later
+        )
+        intent = intent_result.intent
+        intent_confidence = intent_result.confidence
+    except Exception as e:
+        # Log intent-service failure but continue with fallback logic
+        loki.log(
+            "error",
+            {
+                "event_type": "intent_error",
+                "user": req.user_id,
+                "channel": req.channel,
+                "session_id": session_id,
+                "error": str(e),
+            },
+            service_type="intent_service",
+            sync_mode="async",
+            io="none",
+        )
+        # keep intent="unknown" and intent_confidence=None
+
+    # 4) Map intent → route
     if intent == "menu":
         route = "menu"
     else:
@@ -149,10 +171,10 @@ def orchestrate(req: OrchestrateRequest):
 
     state.last_route = route
 
-    # 4) Log INPUT at orchestrator level (including intent)
+    # 5) Log INPUT at orchestrator level (including intent)
     loki.log(
-        level="info",
-        payload={
+        "info",
+        {
             "event_type": "input",
             "user": req.user_id,
             "channel": req.channel,
@@ -160,7 +182,7 @@ def orchestrate(req: OrchestrateRequest):
             "turn": state.turn_count,
             "route": route,
             "intent": intent,
-            "intent_confidence": intent_result.confidence,
+            "intent_confidence": intent_confidence,
             "text": req.text,
         },
         service_type="orchestrator",
@@ -200,10 +222,10 @@ def orchestrate(req: OrchestrateRequest):
 
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
-        # 5) Log OUTPUT at orchestrator level
+        # 6) Log OUTPUT at orchestrator level
         loki.log(
-            level="info",
-            payload={
+            "info",
+            {
                 "event_type": "output",
                 "user": req.user_id,
                 "channel": req.channel,
@@ -212,7 +234,7 @@ def orchestrate(req: OrchestrateRequest):
                 "latency_ms": latency_ms,
                 "route": route,
                 "intent": intent,
-                "intent_confidence": intent_result.confidence,
+                "intent_confidence": intent_confidence,
                 "message": "request_end",
             },
             service_type="orchestrator",
@@ -230,10 +252,10 @@ def orchestrate(req: OrchestrateRequest):
     except Exception as e:
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
-        # 6) Log ERROR at orchestrator level
+        # 7) Log ERROR at orchestrator level
         loki.log(
-            level="error",
-            payload={
+            "error",
+            {
                 "event_type": "error",
                 "user": req.user_id,
                 "channel": req.channel,
@@ -242,7 +264,7 @@ def orchestrate(req: OrchestrateRequest):
                 "latency_ms": latency_ms,
                 "route": route,
                 "intent": intent,
-                "intent_confidence": intent_result.confidence,
+                "intent_confidence": intent_confidence,
                 "error": str(e),
             },
             service_type="orchestrator",
@@ -250,4 +272,3 @@ def orchestrate(req: OrchestrateRequest):
             io="none",
         )
         raise HTTPException(status_code=500, detail="Internal error in orchestrator")
-

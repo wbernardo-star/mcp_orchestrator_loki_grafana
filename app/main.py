@@ -1,17 +1,19 @@
-#main.py extract_menu fix
+#app/main.py New
 
+
+# app/main.py
 from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Dict, Optional, Any
+from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from .logging_loki import loki
 from .menu_service import fetch_menu
-from .intent_service import classify_intent  # LLM-based intent service
+from .intent_service import classify_intent  # LLM-based intent classifier
 
 
 # ----------------- Pydantic models -----------------
@@ -53,85 +55,99 @@ def get_session(session_id: str) -> SessionState:
 # ----------------- Helpers -----------------
 
 
-def extract_menu_text(menu_payload: Any) -> str:
+def extract_menu_text(menu_payload: Dict) -> str:
     """
     Extract a human-readable menu text from the menu_service (n8n) response.
 
     Supports shapes like:
-      { "output": "Here is the menu ..." }            # AI agent style
-      { "menu": "..." }                               # explicit key
-      { "categories": [ { name, items[...] } ] }      # structured menu
-      [ { "output": "..." } ]                         # list-wrapped
-      or, as a last resort, any long string value in the JSON.
+      { "output": "Here is the menu ..." }                # AI agent style
+      { "menu": "..." }                                   # explicit key
+      { "categories": [ { name, items[...] } ] }          # structured list
+      { "categories": { "Mains": [...], "Drinks": [...]}} # structured dict
     """
-
-    # If n8n wrapped it in a list, unwrap the first element
-    if isinstance(menu_payload, list) and menu_payload:
-        menu_payload = menu_payload[0]
-
-    # If it's just a raw string, return it
-    if isinstance(menu_payload, str):
-        return menu_payload.strip()
-
     if not isinstance(menu_payload, dict):
         return ""
 
-    # 1) AI / Respond-to-webhook style
-    out = menu_payload.get("output")
-    if isinstance(out, str) and out.strip():
-        return out.strip()
+    # 1) Simple text-style outputs
+    if isinstance(menu_payload.get("output"), str):
+        return menu_payload["output"].strip()
 
-    # 2) Alternate explicit key
-    out = menu_payload.get("menu")
-    if isinstance(out, str) and out.strip():
-        return out.strip()
+    if isinstance(menu_payload.get("menu"), str):
+        return menu_payload["menu"].strip()
 
-    # 3) Any “long” string value anywhere in the dict
-    for v in menu_payload.values():
-        if isinstance(v, str) and len(v.strip()) > 40:
-            return v.strip()
+    # 2) Structured categories
+    cats = menu_payload.get("categories")
+    if not cats:
+        return ""
 
-    # 4) Structured categories → build a readable text
-    if "categories" in menu_payload and isinstance(menu_payload["categories"], list):
-        lines = []
-        for cat in menu_payload["categories"]:
-            if not isinstance(cat, dict):
+    lines: list[str] = []
+
+    # 2a) categories as a dict: { "Mains": [...], "Drinks": [...] }
+    if isinstance(cats, dict):
+        for cat_name, items in cats.items():
+            item_names = ""
+            if isinstance(items, list):
+                item_names = ", ".join(
+                    (i.get("name") if isinstance(i, dict) else str(i))
+                    for i in items
+                )
+            else:
+                item_names = str(items) if items is not None else ""
+
+            if item_names:
+                lines.append(f"{cat_name}: {item_names}")
+            else:
+                lines.append(str(cat_name))
+
+    # 2b) categories as a list
+    elif isinstance(cats, list):
+        for c in cats:
+            # category as plain string
+            if isinstance(c, str):
+                lines.append(c)
                 continue
 
-            cname = str(cat.get("name", "Category"))
+            if not isinstance(c, dict):
+                continue
+
+            name = (
+                c.get("name")
+                or c.get("category")
+                or c.get("title")
+                or "Category"
+            )
+
             items = (
-                cat.get("items")
-                or cat.get("menu_items")
+                c.get("items")
+                or c.get("menu_items")
+                or c.get("dishes")
                 or []
             )
 
-            item_names = []
+            # items may be list of dicts or list of strings or a single string
+            item_names = ""
             if isinstance(items, list):
-                for it in items:
-                    if isinstance(it, dict):
-                        nm = it.get("name") or it.get("title") or ""
-                        if not nm:
-                            continue
-                        price = it.get("price")
-                        if price is not None:
-                            item_names.append(f"{nm} ({price})")
-                        else:
-                            item_names.append(str(nm))
-                    elif isinstance(it, str):
-                        item_names.append(it)
+                item_names = ", ".join(
+                    (i.get("name") if isinstance(i, dict) else str(i))
+                    for i in items
+                )
+            elif items:
+                item_names = str(items)
 
             if item_names:
-                lines.append(f"{cname}: " + ", ".join(item_names))
+                lines.append(f"{name}: {item_names}")
             else:
-                # At least show the category name, but not *only* that
-                lines.append(cname)
+                # maybe we have description/text instead of explicit items
+                desc = c.get("description") or c.get("text")
+                if desc:
+                    lines.append(f"{name}: {desc}")
+                else:
+                    lines.append(name)
 
-        if lines:
-            return "Here is the menu:\n" + "\n".join(lines)
+    if lines:
+        return "Here is the menu:\n" + "\n".join(lines)
 
-    # 5) Fallback – stringify the JSON so the user still sees something
-    return str(menu_payload)
-
+    return ""
 
 # ----------------- FastAPI app -----------------
 
@@ -141,9 +157,10 @@ app = FastAPI(title="MCP Orchestrator – Thin Sync (Intent + Menu microservice)
 
 @app.get("/health")
 def health_check():
+    # NOTE: using positional args for LokiLogger.log(level, message, **labels)
     loki.log(
-        level="info",
-        payload={"event_type": "health"},
+        "info",
+        {"event_type": "health"},
         service_type="orchestrator",
         sync_mode="sync",
         io="none",
@@ -161,17 +178,39 @@ def orchestrate(req: OrchestrateRequest):
     state.turn_count += 1
     state.last_active_at = datetime.now(timezone.utc)
 
-    # 2) Call internal LLM intent service
-    intent_result = classify_intent(
-        text=req.text,
-        user_id=req.user_id,
-        channel=req.channel,
-        session_id=session_id,
-        history=None,
-    )
-    intent = intent_result.intent  # "menu", "order", "greeting", "smalltalk", "unknown"
+    # 2) Safe defaults for intent in case intent_service fails
+    intent: str = "unknown"
+    intent_confidence: Optional[float] = None
 
-    # 3) Map intent → route
+    # 3) Call internal LLM intent service (instead of keyword detect_route)
+    try:
+        intent_result = classify_intent(
+            text=req.text,
+            user_id=req.user_id,
+            channel=req.channel,
+            session_id=session_id,
+            history=None,  # you can pass short history later
+        )
+        intent = intent_result.intent
+        intent_confidence = intent_result.confidence
+    except Exception as e:
+        # Log intent-service failure but continue with fallback logic
+        loki.log(
+            "error",
+            {
+                "event_type": "intent_error",
+                "user": req.user_id,
+                "channel": req.channel,
+                "session_id": session_id,
+                "error": str(e),
+            },
+            service_type="intent_service",
+            sync_mode="async",
+            io="none",
+        )
+        # keep intent="unknown" and intent_confidence=None
+
+    # 4) Map intent → route
     if intent == "menu":
         route = "menu"
     else:
@@ -179,10 +218,10 @@ def orchestrate(req: OrchestrateRequest):
 
     state.last_route = route
 
-    # 4) Log INPUT at orchestrator level (including intent)
+    # 5) Log INPUT at orchestrator level (including intent)
     loki.log(
-        level="info",
-        payload={
+        "info",
+        {
             "event_type": "input",
             "user": req.user_id,
             "channel": req.channel,
@@ -190,7 +229,7 @@ def orchestrate(req: OrchestrateRequest):
             "turn": state.turn_count,
             "route": route,
             "intent": intent,
-            "intent_confidence": intent_result.confidence,
+            "intent_confidence": intent_confidence,
             "text": req.text,
         },
         service_type="orchestrator",
@@ -230,10 +269,10 @@ def orchestrate(req: OrchestrateRequest):
 
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
-        # 5) Log OUTPUT at orchestrator level
+        # 6) Log OUTPUT at orchestrator level
         loki.log(
-            level="info",
-            payload={
+            "info",
+            {
                 "event_type": "output",
                 "user": req.user_id,
                 "channel": req.channel,
@@ -242,7 +281,7 @@ def orchestrate(req: OrchestrateRequest):
                 "latency_ms": latency_ms,
                 "route": route,
                 "intent": intent,
-                "intent_confidence": intent_result.confidence,
+                "intent_confidence": intent_confidence,
                 "message": "request_end",
             },
             service_type="orchestrator",
@@ -260,10 +299,10 @@ def orchestrate(req: OrchestrateRequest):
     except Exception as e:
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
-        # 6) Log ERROR at orchestrator level
+        # 7) Log ERROR at orchestrator level
         loki.log(
-            level="error",
-            payload={
+            "error",
+            {
                 "event_type": "error",
                 "user": req.user_id,
                 "channel": req.channel,
@@ -272,7 +311,7 @@ def orchestrate(req: OrchestrateRequest):
                 "latency_ms": latency_ms,
                 "route": route,
                 "intent": intent,
-                "intent_confidence": intent_result.confidence,
+                "intent_confidence": intent_confidence,
                 "error": str(e),
             },
             service_type="orchestrator",

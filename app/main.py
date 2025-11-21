@@ -60,47 +60,94 @@ def extract_menu_text(menu_payload: Dict) -> str:
     Extract a human-readable menu text from the menu_service (n8n) response.
 
     Supports shapes like:
-      { "output": "Here is the menu ..." }      # AI agent style
-      { "menu": "..." }                         # explicit key
-      { "categories": [ { name, items[...] } ]} # structured menu
+      { "output": "Here is the menu ..." }                # AI agent style
+      { "menu": "..." }                                   # explicit key
+      { "categories": [ { name, items[...] } ] }          # structured list
+      { "categories": { "Mains": [...], "Drinks": [...]}} # structured dict
     """
-
     if not isinstance(menu_payload, dict):
         return ""
 
-    # 1) AI / Respond-to-webhook style
+    # 1) Simple text-style outputs
     if isinstance(menu_payload.get("output"), str):
         return menu_payload["output"].strip()
 
-    # 2) Alternate explicit key
     if isinstance(menu_payload.get("menu"), str):
         return menu_payload["menu"].strip()
 
-    # 3) Structured categories → build a simple text
-    if "categories" in menu_payload:
-        try:
-            cats = menu_payload["categories"]
-            lines = []
-            for c in cats:
-                if not isinstance(c, dict):
-                    continue
-                name = c.get("name", "Category")
-                items = c.get("items") or []
+    # 2) Structured categories
+    cats = menu_payload.get("categories")
+    if not cats:
+        return ""
+
+    lines: list[str] = []
+
+    # 2a) categories as a dict: { "Mains": [...], "Drinks": [...] }
+    if isinstance(cats, dict):
+        for cat_name, items in cats.items():
+            item_names = ""
+            if isinstance(items, list):
                 item_names = ", ".join(
-                    i.get("name", "") for i in items if isinstance(i, dict)
+                    (i.get("name") if isinstance(i, dict) else str(i))
+                    for i in items
                 )
-                if item_names:
-                    lines.append(f"{name}: {item_names}")
+            else:
+                item_names = str(items) if items is not None else ""
+
+            if item_names:
+                lines.append(f"{cat_name}: {item_names}")
+            else:
+                lines.append(str(cat_name))
+
+    # 2b) categories as a list
+    elif isinstance(cats, list):
+        for c in cats:
+            # category as plain string
+            if isinstance(c, str):
+                lines.append(c)
+                continue
+
+            if not isinstance(c, dict):
+                continue
+
+            name = (
+                c.get("name")
+                or c.get("category")
+                or c.get("title")
+                or "Category"
+            )
+
+            items = (
+                c.get("items")
+                or c.get("menu_items")
+                or c.get("dishes")
+                or []
+            )
+
+            # items may be list of dicts or list of strings or a single string
+            item_names = ""
+            if isinstance(items, list):
+                item_names = ", ".join(
+                    (i.get("name") if isinstance(i, dict) else str(i))
+                    for i in items
+                )
+            elif items:
+                item_names = str(items)
+
+            if item_names:
+                lines.append(f"{name}: {item_names}")
+            else:
+                # maybe we have description/text instead of explicit items
+                desc = c.get("description") or c.get("text")
+                if desc:
+                    lines.append(f"{name}: {desc}")
                 else:
                     lines.append(name)
-            if lines:
-                return "Here is the menu:\n" + "\n".join(lines)
-        except Exception:
-            # if parsing fails, just fall through to ""
-            pass
+
+    if lines:
+        return "Here is the menu:\n" + "\n".join(lines)
 
     return ""
-
 
 # ----------------- FastAPI app -----------------
 

@@ -1,81 +1,131 @@
-# app/logging_loki.py
+#loki sync i/o
+
 import os
 import time
 import json
-from typing import Any, Dict, Optional
-
 import requests
 
 
 class LokiLogger:
-    def __init__(
-        self,
-        endpoint: Optional[str] = None,
-        app_name: str = "mcp_orchestrator_sync",
-    ) -> None:
-        self.endpoint = endpoint or os.getenv("LOKI_ENDPOINT")
-        self.basic_auth = os.getenv("LOKI_BASIC_AUTH")  # e.g. "user:token"
-        self.app_name = app_name
+    """
+    Helper to push structured logs to Grafana Loki.
 
-        if self.endpoint:
-            print(f"[LokiLogger] Enabled, pushing to {self.endpoint}")
+    Env vars:
+      - GRAFANA_LOKI_URL       e.g. https://logs-prod-025.grafana.net/loki/api/v1/push
+      - GRAFANA_LOKI_USERNAME  e.g. 1401328  (tenant / user ID)
+      - GRAFANA_LOKI_API_TOKEN token with logs:write
+      - MCP_APP_LABEL          (optional) app label, default "mcp_orchestrator_sync"
+
+    Labels used in Loki:
+      - app          (fixed per service)
+      - level        (info / error / warning)
+      - event        (input / output / error / health / session_reset / ...)
+      - service      (orchestrator / llm / tts / webhook / ...)
+      - flow         (food_order / none / ...)
+      - step         (ask_category / collect_items / ...)
+      - intent       (optional future)
+      - outcome      (optional future)
+      - mode         (sync / async)
+      - io           (in / out)
+    """
+
+    def __init__(self) -> None:
+        self.url = os.getenv("GRAFANA_LOKI_URL")
+        self.username = os.getenv("GRAFANA_LOKI_USERNAME")
+        self.token = os.getenv("GRAFANA_LOKI_API_TOKEN")
+        self.app_label = os.getenv("MCP_APP_LABEL", "mcp_orchestrator_sync")
+
+        self.enabled = all([self.url, self.username, self.token])
+        if not self.enabled:
+            print("[LokiLogger] Disabled – missing GRAFANA_LOKI_* env vars")
         else:
-            print("[LokiLogger] Disabled (no LOKI_ENDPOINT set)")
+            print("[LokiLogger] Enabled, pushing to", self.url)
 
-    def log(self, level: str, payload: Dict[str, Any], **labels: Any) -> None:
-        """
-        level   : 'info' | 'error' | ...
-        payload : JSON dict that will be stored as the log line
-        labels  : extra Loki labels (service_type, sync_mode, io, event, etc.)
-        """
-        # If Loki not configured, just print to stdout and bail.
-        if not self.endpoint:
-            print(f"[{level.upper()}]", payload, labels)
-            return
+    # ----------------- internal helpers -----------------
 
-        # Base labels
-        event_type = payload.get("event_type", "unknown")
-        base_labels: Dict[str, str] = {
-            "app": self.app_name,
+    def _build_stream_labels(self, level: str, fields: dict) -> dict:
+        """
+        Build Loki 'stream' labels (low-cardinality only).
+        """
+        labels = {
+            "app": self.app_label,
             "level": level,
-            "event": event_type,
         }
 
-        # Merge extra labels (coerce to str, skip None)
-        for k, v in labels.items():
-            if v is not None:
-                base_labels[k] = str(v)
+        # Event name (e.g. input/output/error/health/request_start/request_end)
+        event = fields.get("event") or fields.get("event_type")
+        if event:
+            labels["event"] = str(event)
 
-        # Loki expects nanoseconds since epoch
-        ts_ns = int(time.time() * 1_000_000_000)
+        # Promote keys to Loki labels
+        mapping = {
+            "service_type": "service",
+            "service": "service",
+            "flow": "flow",
+            "step": "step",
+            "intent": "intent",
+            "outcome": "outcome",
+            "sync_mode": "mode",   # <-- sync vs async
+            "io": "io",            # <-- input vs output
+        }
 
-        line = json.dumps(payload, separators=(",", ":"))
+        for src, dst in mapping.items():
+            val = fields.get(src)
+            if val not in (None, "", []):
+                labels[dst] = str(val)
+
+        return labels
+
+    # ----------------- public API -----------------
+
+    def log(self, level: str, message, **fields) -> None:
+        """
+        Main logging function used by the rest of the app.
+
+        level   : "info", "warning", "error", etc.
+        message : str OR dict
+        fields  : extra context: event, flow, step, service_type,
+                  session_id, sync_mode, io, etc.
+        """
+        if not self.enabled:
+            return
+
+        if isinstance(message, dict):
+            payload_fields = {**fields, **message}
+        else:
+            payload_fields = {**fields, "message": str(message)}
+
+        ts_ns = int(time.time() * 1_000_000_000)  # nanoseconds
+
+        stream_labels = self._build_stream_labels(level, payload_fields)
+
         body = {
             "streams": [
                 {
-                    "stream": base_labels,
-                    "values": [[str(ts_ns), line]],
+                    "stream": stream_labels,
+                    "values": [
+                        [str(ts_ns), json.dumps(payload_fields, ensure_ascii=False)]
+                    ],
                 }
             ]
         }
 
-        headers = {"Content-Type": "application/json"}
-        if self.basic_auth:
-            # basic_auth is "user:password" → Base64 via requests.auth?
-            # Loki/Grafana Cloud also accepts it via HTTP header:
-            headers["Authorization"] = f"Basic {self.basic_auth}"
-
         try:
-            requests.post(
-                self.endpoint,
-                data=json.dumps(body),
-                headers=headers,
-                timeout=1.0,
+            resp = requests.post(
+                self.url,
+                auth=(self.username, self.token),
+                json=body,
+                timeout=4,
             )
+            if resp.status_code not in (200, 204):
+                print(
+                    "[LokiLogger] Push failed:",
+                    resp.status_code,
+                    resp.text[:200],
+                )
         except Exception as e:
-            # Don't crash the app if logging fails
-            print("[LokiLogger] Push failed:", e)
+            print("[LokiLogger] Exception while pushing to Loki:", e)
 
 
-# Singleton instance used everywhere
+# Global logger used by main.py
 loki = LokiLogger()

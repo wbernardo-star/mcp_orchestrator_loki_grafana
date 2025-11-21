@@ -1,3 +1,6 @@
+#app/main.py New
+
+
 # app/main.py
 from __future__ import annotations
 
@@ -10,6 +13,7 @@ from pydantic import BaseModel
 
 from .logging_loki import loki
 from .menu_service import fetch_menu
+from .intent_service import classify_intent  # NEW
 
 
 # ----------------- Pydantic models -----------------
@@ -49,29 +53,6 @@ def get_session(session_id: str) -> SessionState:
 
 
 # ----------------- Helpers -----------------
-
-
-def detect_route(text: str) -> str:
-    """
-    Super-simple router:
-      - "menu"   → call menu_service
-      - default  → generic reply (for now)
-    Later you can expand this to call intent_service, order_service, etc.
-    """
-    t = text.lower().strip()
-    menu_keywords = [
-        "get the menu",
-        "show me the menu",
-        "what's on the menu",
-        "whats on the menu",
-        "read me the menu",
-        "can you read me the menu",
-        "menu please",
-        "i want to see the menu",
-    ]
-    if any(kw in t for kw in menu_keywords):
-        return "menu"
-    return "fallback"
 
 
 def extract_menu_text(menu_payload: Dict) -> str:
@@ -124,7 +105,7 @@ def extract_menu_text(menu_payload: Dict) -> str:
 # ----------------- FastAPI app -----------------
 
 
-app = FastAPI(title="MCP Orchestrator – Thin Sync (Menu microservice first)")
+app = FastAPI(title="MCP Orchestrator – Thin Sync (Intent + Menu microservice)")
 
 
 @app.get("/health")
@@ -149,11 +130,26 @@ def orchestrate(req: OrchestrateRequest):
     state.turn_count += 1
     state.last_active_at = datetime.now(timezone.utc)
 
-    # 2) Decide which route / microservice to call
-    route = detect_route(req.text)
+    # 2) Call internal LLM intent service (instead of keyword detect_route)
+    #    For now we don't keep history; you can add it later if needed.
+    intent_result = classify_intent(
+        text=req.text,
+        user_id=req.user_id,
+        channel=req.channel,
+        session_id=session_id,
+        history=None,
+    )
+    intent = intent_result.intent  # "menu", "order", "greeting", "smalltalk", "unknown"
+
+    # 3) Map intent → route
+    if intent == "menu":
+        route = "menu"
+    else:
+        route = "fallback"
+
     state.last_route = route
 
-    # 3) Log INPUT at orchestrator level
+    # 4) Log INPUT at orchestrator level (including intent)
     loki.log(
         level="info",
         payload={
@@ -163,6 +159,8 @@ def orchestrate(req: OrchestrateRequest):
             "session_id": session_id,
             "turn": state.turn_count,
             "route": route,
+            "intent": intent,
+            "intent_confidence": intent_result.confidence,
             "text": req.text,
         },
         service_type="orchestrator",
@@ -202,7 +200,7 @@ def orchestrate(req: OrchestrateRequest):
 
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
-        # 4) Log OUTPUT at orchestrator level
+        # 5) Log OUTPUT at orchestrator level
         loki.log(
             level="info",
             payload={
@@ -213,6 +211,8 @@ def orchestrate(req: OrchestrateRequest):
                 "turn": state.turn_count,
                 "latency_ms": latency_ms,
                 "route": route,
+                "intent": intent,
+                "intent_confidence": intent_result.confidence,
                 "message": "request_end",
             },
             service_type="orchestrator",
@@ -230,7 +230,7 @@ def orchestrate(req: OrchestrateRequest):
     except Exception as e:
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
-        # 5) Log ERROR at orchestrator level
+        # 6) Log ERROR at orchestrator level
         loki.log(
             level="error",
             payload={
@@ -241,6 +241,8 @@ def orchestrate(req: OrchestrateRequest):
                 "turn": state.turn_count,
                 "latency_ms": latency_ms,
                 "route": route,
+                "intent": intent,
+                "intent_confidence": intent_result.confidence,
                 "error": str(e),
             },
             service_type="orchestrator",
@@ -248,3 +250,4 @@ def orchestrate(req: OrchestrateRequest):
             io="none",
         )
         raise HTTPException(status_code=500, detail="Internal error in orchestrator")
+

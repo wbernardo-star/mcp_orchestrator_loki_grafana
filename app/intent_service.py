@@ -1,225 +1,166 @@
-#app/intent_service.py via LLM
+#FLOWSERVICE app/intent_service.py
 
-"""
-Internal LLM-based Intent Service for MCP Orchestrator.
-
-Responsibility:
-  - Take user's latest text (and some context if needed)
-  - Ask an LLM to classify it into a small set of intents
-  - Return a structured result: intent + confidence
-
-This keeps all the phrase-matching logic OUT of main.py.
-"""
+# app/intent_service.py
 
 from __future__ import annotations
 
-import json
 import os
 import time
-from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional
+from pydantic import BaseModel
 
 from openai import OpenAI
-
 from .logging_loki import loki
 
 
-# ------------- Config -------------
+# ------------------------------------------------------
+# Pydantic result model
+# ------------------------------------------------------
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-INTENT_MODEL = os.getenv("INTENT_MODEL", "gpt-4o-mini")
-
-if not OPENAI_API_KEY:
-    # We won't raise here, but calls will fail; Loki will record the errors.
-    pass
-
-_openai_client: Optional[OpenAI] = None
-
-
-def get_openai_client() -> OpenAI:
-    global _openai_client
-    if _openai_client is None:
-        _openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    return _openai_client
-
-
-# ------------- Data model -------------
-
-
-@dataclass
-class IntentResult:
+class IntentResult(BaseModel):
     intent: str
     confidence: float
-    raw_json: dict
+    raw_text: str
 
 
-# ------------- Core classifier -------------
+# ------------------------------------------------------
+# OpenAI client (v2 SDK)
+# ------------------------------------------------------
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+MODEL = os.getenv("INTENT_MODEL", "gpt-4o-mini")
+
+
+# ------------------------------------------------------
+# Intent classifier
+# ------------------------------------------------------
 
 def classify_intent(
     text: str,
     user_id: str,
     channel: str,
     session_id: str,
-    history: Optional[List[str]] = None,
+    history: Optional[list] = None,
 ) -> IntentResult:
     """
-    Use OpenAI Chat Completions to classify the user's message
-    into a small, fixed set of intents.
+    Classification rules:
+         menu
+         order
+         greeting
+         smalltalk
+         unknown
 
-    Intents (v1):
-      - "menu"      → user wants to see/hear the menu
-      - "order"     → user wants to place an order
-      - "greeting"  → "hello", "hi", "hey"
-      - "smalltalk" → chit-chat not related to food logic
-      - "unknown"   → anything else
-
-    Returns:
-      IntentResult(intent=..., confidence=..., raw_json=...)
+    This service is synchronous (sync_mode=sync).
     """
+
     start = time.perf_counter()
 
-    # ------- Default result in case LLM fails --------
-    default_result = IntentResult(
-        intent="unknown",
-        confidence=0.0,
-        raw_json={
-            "intent": "unknown",
-            "confidence": 0.0,
-            "error": "default_fallback",
-        },
-    )
-
-    if not OPENAI_API_KEY:
-        # Log missing config and return default
-        loki.log(
-            "error",
-            {
-                "event_type": "service_error",
-                "user": user_id,
-                "channel": channel,
-                "session_id": session_id,
-                "error": "OPENAI_API_KEY not set",
-            },
-            service_type="intent_service",
-            sync_mode="async",
-            io="none",
-        )
-        return default_result
-
-    # ------- Log OUTGOING call (async-style) --------
+    # ---- log START ----
     loki.log(
         "info",
         {
-            "event_type": "service_call",
-            "reason": "classify_intent",
+            "event_type": "intent_call",
             "user": user_id,
             "channel": channel,
             "session_id": session_id,
+            "text": text,
         },
         service_type="intent_service",
-        sync_mode="async",  # external HTTP to OpenAI
+        sync_mode="sync",
         io="out",
     )
 
-    client = get_openai_client()
+    prompt = f"""
+Classify the user's intent into EXACTLY one of the following labels:
 
-    system_prompt = """
-You are an intent classifier for Blink's food assistant.
+- menu        (asking for the menu)
+- order       (wants to order food)
+- greeting    (hello, hi, hey)
+- smalltalk   (conversation that is neither menu nor order)
+- unknown     (does not match anything)
 
-Your job is to classify the user's latest message into ONE of these intents:
+Return ONLY JSON in this format:
+{{
+  "intent": "...",
+  "confidence": 0.0
+}}
 
-- "menu"      : user is asking about the menu, dishes, what they can order.
-- "order"     : user is expressing desire to place an order (even if vague).
-- "greeting"  : user is just greeting ("hi", "hello", "hey") with no clear food intent.
-- "smalltalk" : user is chatting, asking about you, or saying things unrelated to ordering.
-- "unknown"   : cannot confidently match any of the above.
-
-Return ONLY a JSON object with keys:
-- "intent"     : string, one of ["menu","order","greeting","smalltalk","unknown"]
-- "confidence" : number between 0.0 and 1.0 indicating classifier confidence.
-
-No extra text, no explanations. Only JSON.
-""".strip()
-
-    history = history or []
-    history_str = ""
-    if history:
-        # lightweight representation
-        history_str = "Conversation history:\n" + "\n".join(
-            f"- {msg}" for msg in history[-5:]
-        )
-
-    user_prompt = (
-        (history_str + "\n\n" if history_str else "")
-        + "User message:\n"
-        + text
-    )
+User message:
+{text}
+"""
 
     try:
-        resp = client.chat.completions.create(
-            model=INTENT_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
+            max_tokens=50,
         )
-        content = resp.choices[0].message.content or ""
 
-        # Parse JSON
+        raw = response.choices[0].message.content.strip()
+
+        # Safely parse JSON
+        import json
         try:
-            data = json.loads(content)
+            parsed = json.loads(raw)
         except Exception:
-            data = {}
+            parsed = {"intent": "unknown", "confidence": 0.1}
 
-        intent = str(data.get("intent", "unknown")).strip().lower()
-        confidence_raw = data.get("confidence", 0.0)
-        try:
-            confidence = float(confidence_raw)
-        except Exception:
-            confidence = 0.0
+        intent = parsed.get("intent", "unknown").lower()
+        confidence = float(parsed.get("confidence", 0.1))
 
-        if intent not in {"menu", "order", "greeting", "smalltalk", "unknown"}:
+        # Validate
+        allowed = {"menu", "order", "greeting", "smalltalk", "unknown"}
+        if intent not in allowed:
             intent = "unknown"
-
-        result = IntentResult(intent=intent, confidence=confidence, raw_json=data)
 
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
-        # ------- Log INCOMING result --------
+        # ---- log RETURN ----
         loki.log(
             "info",
             {
-                "event_type": "service_return",
+                "event_type": "intent_return",
                 "user": user_id,
                 "channel": channel,
                 "session_id": session_id,
-                "latency_ms": latency_ms,
                 "intent": intent,
                 "confidence": confidence,
+                "latency_ms": latency_ms,
             },
             service_type="intent_service",
-            sync_mode="async",
+            sync_mode="sync",
             io="in",
         )
 
-        return result
+        return IntentResult(
+            intent=intent,
+            confidence=confidence,
+            raw_text=text,
+        )
 
     except Exception as e:
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
+
         loki.log(
             "error",
             {
-                "event_type": "service_error",
+                "event_type": "intent_error",
                 "user": user_id,
                 "channel": channel,
                 "session_id": session_id,
-                "latency_ms": latency_ms,
                 "error": str(e),
+                "latency_ms": latency_ms,
             },
             service_type="intent_service",
-            sync_mode="async",
+            sync_mode="sync",
             io="none",
         )
-        return default_result
+
+        return IntentResult(
+            intent="unknown",
+            confidence=0.0,
+            raw_text=text,
+        )

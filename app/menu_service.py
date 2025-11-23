@@ -1,8 +1,6 @@
-#FLOWSERVICE app/menu_service.py
+#Flow menu_service.py Fix
 
 # app/menu_service.py
-
-from __future__ import annotations
 
 import os
 import time
@@ -13,42 +11,28 @@ import requests
 from .logging_loki import loki
 
 
-# ------------------------------------------------------
-# Environment
-# ------------------------------------------------------
+MENU_SERVICE_URL = os.getenv("MENU_SERVICE_URL")
 
-MENU_SERVICE_URL = os.getenv("MENU_SERVICE_URL")   # n8n webhook URL
-MENU_TIMEOUT = float(os.getenv("MENU_SERVICE_TIMEOUT", "8.0"))
-
-
-# ------------------------------------------------------
-# Menu Service (async microservice)
-# ------------------------------------------------------
 
 def fetch_menu(user_id: str, channel: str, session_id: str) -> Dict[str, Any]:
     """
-    Calls the external menu microservice (n8n webhook or REST API)
-    to retrieve the restaurant menu.
+    Fetch the restaurant menu from an external service (n8n webhook).
 
-    This is treated as an ASYNC microservice in logging:
-       sync_mode = "async"
-       io        = "out" (request) / "in" (response)
+    Normalizes n8n's response shape, e.g.:
 
-    Expected response formats:
+    [
       {
-        "output": "Here is the menu..."
+        "output": { "text": "Pepperoni - Pizza - 100\n..." }
       }
-      {
-        "menu": "..."
-      }
-      {
-        "categories": [
-            { "name": "...", "items": [ { "name": "...", "price": 10.50 }, ... ] }
-        ]
-      }
+    ]
+
+    into:
+
+    {
+      "output": "Pepperoni - Pizza - 100\n..."
+    }
     """
 
-    # If no URL is configured → log and return empty
     if not MENU_SERVICE_URL:
         loki.log(
             "warning",
@@ -63,19 +47,19 @@ def fetch_menu(user_id: str, channel: str, session_id: str) -> Dict[str, Any]:
             sync_mode="async",
             io="none",
         )
-        return {"error": "MENU_SERVICE_URL not configured", "categories": []}
+        return {}
 
     start = time.perf_counter()
 
-    # ------------- LOG OUTGOING REQUEST -------------
+    # ---- OUTGOING CALL LOG (async OUT) ----
     loki.log(
         "info",
         {
             "event_type": "service_call",
+            "reason": "get_menu",
             "user": user_id,
             "channel": channel,
             "session_id": session_id,
-            "reason": "fetch_menu",
         },
         service_type="menu_service",
         sync_mode="async",
@@ -83,18 +67,37 @@ def fetch_menu(user_id: str, channel: str, session_id: str) -> Dict[str, Any]:
     )
 
     try:
-        # n8n usually expects GET, but can also be POST depending on your workflow
-        response = requests.get(MENU_SERVICE_URL, timeout=MENU_TIMEOUT)
-        response.raise_for_status()
+        resp = requests.get(MENU_SERVICE_URL, timeout=10.0)
+        resp.raise_for_status()
+        data = resp.json()
 
-        data = response.json()
+        # --- NORMALIZATION STEP ---
+
+        # If it's a list, take the first element
+        if isinstance(data, list) and data:
+            first = data[0]
+        else:
+            first = data
+
+        # Expect dict with "output"
+        if isinstance(first, dict):
+            out = first.get("output")
+        else:
+            out = None
+
+        # If output is an object with "text", flatten it
+        if isinstance(out, dict) and isinstance(out.get("text"), str):
+            normalized = {"output": out["text"]}
+        # If output is already a string, just pass it through
+        elif isinstance(out, str):
+            normalized = {"output": out}
+        else:
+            # Unknown shape – log and treat as empty
+            normalized = {}
+
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
 
-        cat_count = 0
-        if isinstance(data, dict) and "categories" in data and isinstance(data["categories"], list):
-            cat_count = len(data["categories"])
-
-        # ------------- LOG SUCCESS RESPONSE -------------
+        # ---- INCOMING RESPONSE LOG (async IN) ----
         loki.log(
             "info",
             {
@@ -103,19 +106,17 @@ def fetch_menu(user_id: str, channel: str, session_id: str) -> Dict[str, Any]:
                 "channel": channel,
                 "session_id": session_id,
                 "latency_ms": latency_ms,
-                "menu_category_count": cat_count,
+                "raw_shape": type(data).__name__,
             },
             service_type="menu_service",
             sync_mode="async",
             io="in",
         )
 
-        return data
+        return normalized
 
     except Exception as e:
         latency_ms = round((time.perf_counter() - start) * 1000.0, 3)
-
-        # ------------- LOG ERROR RESPONSE -------------
         loki.log(
             "error",
             {
@@ -130,8 +131,4 @@ def fetch_menu(user_id: str, channel: str, session_id: str) -> Dict[str, Any]:
             sync_mode="async",
             io="none",
         )
-
-        return {
-            "error": str(e),
-            "categories": []
-        }
+        return {}
